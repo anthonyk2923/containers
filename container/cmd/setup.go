@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 )
 
+var copiedLibs = make(map[string]bool)
+
 func Setup(reqPath, sandboxPath string) {
 	file, err := os.Open(reqPath)
 	if err != nil {
@@ -27,14 +29,8 @@ func Setup(reqPath, sandboxPath string) {
 		}
 		line := scanner.Text()
 		destPath := filepath.Join(sandboxPath, filepath.Base(line))
-		if err := copy(line, destPath); err != nil {
+		if err := copy(line, destPath, sandboxPath); err != nil {
 			log.Panic(err)
-		}
-		if err := copyLibs(line, sandboxPath); err != nil {
-			log.Panic("failed to copy libs: ", err)
-		}
-		if err := os.Chmod(destPath, 0755); err != nil {
-			log.Panicf("Failed to set execute permissions on %s: %v", destPath, err)
 		}
 	}
 
@@ -58,10 +54,16 @@ func applyChmodRecursive(rootPath string, mode os.FileMode) error {
 func copyLibs(binary, sandboxPath string) error {
 	libraries, err := ldd.List(binary)
 	if err != nil {
-		log.Fatalf("Error retrieving libraries for %s: %v", binary, err)
+		log.Printf("Error retrieving libraries for %s: %v", binary, err)
+		return nil
 	}
 
 	for _, lib := range libraries {
+		if copiedLibs[lib] {
+			continue
+		}
+
+		copiedLibs[lib] = true
 		destPath := filepath.Join(sandboxPath, lib)
 
 		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
@@ -69,7 +71,7 @@ func copyLibs(binary, sandboxPath string) error {
 			continue
 		}
 
-		if err := copy(lib, destPath); err != nil {
+		if err := copy(lib, destPath, sandboxPath); err != nil {
 			log.Printf("Failed to copy %s: %v", lib, err)
 			continue
 		}
@@ -78,13 +80,45 @@ func copyLibs(binary, sandboxPath string) error {
 	return nil
 }
 
-func copy(fromPath, toPath string) error {
+func copy(fromPath, toPath, sandboxPath string) error {
 	srcFile, err := os.Open(fromPath)
 	if err != nil {
 		return err
 	}
 	defer srcFile.Close()
 
+	info, err := srcFile.Stat()
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		files, err := os.ReadDir(fromPath)
+		if err != nil {
+			return fmt.Errorf("failed to read directory: %v", err)
+		}
+
+		for _, file := range files {
+			if !file.IsDir() {
+				filePath := filepath.Join(fromPath, file.Name())
+				destPath := filepath.Join(sandboxPath, filepath.Base(filePath))
+				if err := copy(filePath, destPath, sandboxPath); err != nil {
+					log.Printf("Failed to copy %s: %v", filePath, err)
+					continue
+				}
+
+				if err := copyLibs(filePath, sandboxPath); err != nil {
+					log.Printf("Failed to copy libs for %s: %v", filePath, err)
+					continue
+				}
+
+				if err := os.Chmod(destPath, 0755); err != nil {
+					log.Printf("Failed to set execute permissions on %s: %v", destPath, err)
+					continue
+				}
+			}
+		}
+		return nil
+	}
 	dstFile, err := os.Create(toPath)
 	if err != nil {
 		return err
@@ -92,5 +126,17 @@ func copy(fromPath, toPath string) error {
 	defer dstFile.Close()
 
 	_, err = io.Copy(dstFile, srcFile)
-	return err
+	if err != nil {
+		return err
+	}
+
+	if err := copyLibs(fromPath, sandboxPath); err != nil {
+		return fmt.Errorf("failed to copy libs: %v", err)
+	}
+
+	if err := os.Chmod(toPath, 0755); err != nil {
+		return fmt.Errorf("Failed to set execute permissions on %s: %v", toPath, err)
+	}
+
+	return nil
 }
